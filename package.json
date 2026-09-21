@@ -1,0 +1,56 @@
+{
+  "name": "f95list-form-v5-scraper",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "prepare": "husky || true",
+    "dev": "bun --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "check": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "test": "bun test",
+    "explore": "bun run scripts/explore.ts"
+  },
+  "config": {
+    "commitizen": {
+      "path": "cz-emoji"
+    },
+    "cz-emoji": {
+      "scopes": [
+        "api",
+        "sync",
+        "server"
+      ],
+      "skipQuestions": [
+        "body",
+        "breaking",
+        "issues"
+      ]
+    }
+  },
+  "lint-staged": {
+    "*.{js,ts}": [
+      "biome check --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "biome format --write"
+    ]
+  },
+  "dependencies": {
+    "hono": "4.13.8",
+    "mysql2": "3.24.4",
+    "pino": "10.3.1",
+    "valibot": "1.5.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@types/bun": "1.4.2",
+    "commitizen": "4.3.2",
+    "cz-emoji": "1.3.2-canary.2",
+    "husky": "9.1.7",
+    "lint-staged": "17.5.1",
+    "typescript": "7.0.2"
+  }
+}
