@@ -15,20 +15,31 @@ export interface TrackedGame {
 export type FailureKind = IndexerErrorKind | 'invalid_timestamp' | 'aborted';
 
 /**
+ * - `fast` : flux `/fast` puis `/full`, seul moyen de déclencher le réindexage côté API ;
+ * - `raw` : `/raw` seulement, sans réindexage ni timestamp. La donnée peut être périmée, ce qui
+ *   suffit pour les jeux inactifs et épargne `/fast` à WillyJL. Les jeux jamais synchronisés
+ *   (`lastChange` nul) passent quand même par `/fast` puis `/full`.
+ */
+export type SyncSource = 'fast' | 'raw';
+
+/**
  * Destination des résultats. Le cycle ne connaît ni la base ni le projet principal : c'est au
  * consommateur de persister `lastChange` avec les données.
  */
 export interface SyncSink {
-  /** Le timestamp a bougé et `/full` a répondu. */
+  /** Le timestamp a bougé et `/full` a répondu, ou `/raw` a répondu (`lastChange` nul : inconnu). */
   onUpdate(update: {
     id: number;
-    lastChange: number;
+    lastChange: number | null;
     thread: Thread;
   }): void | Promise<void>;
   /** Le timestamp n'a pas bougé : rien à écrire, mais la vérification a bien eu lieu. */
   onUnchanged(threadIds: number[]): void | Promise<void>;
   /** `/full` répond `THREAD_MISSING` : politique à définir côté principal (archiver, ignorer…). */
-  onNotFound(gone: { id: number; lastChange: number }): void | Promise<void>;
+  onNotFound(gone: {
+    id: number;
+    lastChange: number | null;
+  }): void | Promise<void>;
   onFailure(failure: {
     id: number;
     kind: FailureKind;
@@ -38,7 +49,7 @@ export interface SyncSink {
 
 export interface SyncProgress {
   total: number;
-  /** Ids dont le timestamp a été vérifié par `/fast`. */
+  /** Ids dont le timestamp a été vérifié par `/fast`, ou dont `/raw` est terminé. */
   checked: number;
   /** Ids dont le timestamp a changé (`/full` nécessaire). */
   changed: number;
@@ -58,8 +69,10 @@ export interface SyncReport extends SyncProgress {
 export interface SyncOptions {
   client: IndexerClient;
   sink: SyncSink;
-  /** Parallélisme des `/full`. `/fast` reste strictement séquentiel quoi qu'il arrive. */
+  /** Parallélisme des `/full` et `/raw`. `/fast` reste strictement séquentiel quoi qu'il arrive. */
   fullConcurrency: number;
+  /** `fast` par défaut. */
+  source?: SyncSource;
   signal?: AbortSignal;
   onProgress?: (progress: SyncProgress) => void;
   now?: () => number;
@@ -114,6 +127,7 @@ export const runSync = async (
     client,
     sink,
     fullConcurrency,
+    source = 'fast',
     signal,
     onProgress,
     now = Date.now,
@@ -131,16 +145,26 @@ export const runSync = async (
   const limit = createLimiter(fullConcurrency);
   const fullTasks: Promise<void>[] = [];
   const emit = () => onProgress?.({ ...progress });
+  const report = (): SyncReport => ({
+    ...progress,
+    ...counters,
+    aborted: signal?.aborted ?? false,
+    durationMs: now() - startedAt,
+  });
 
   const fail = async (id: number, kind: FailureKind, message: string) => {
     counters.failed++;
     await sink.onFailure({ id, kind, message });
   };
 
-  const runFull = async (id: number, ts: number) => {
+  //? `ts` nul : appel à `/raw`, qui ne fournit pas de timestamp.
+  const fetchThread = async (id: number, ts: number | null) => {
     try {
       if (signal?.aborted) return await fail(id, 'aborted', 'Cycle interrompu');
-      const thread = await client.full(id, ts, signal);
+      const thread =
+        ts === null
+          ? await client.raw(id, signal)
+          : await client.full(id, ts, signal);
       await sink.onUpdate({ id, lastChange: ts, thread });
       counters.updated++;
     } catch (error) {
@@ -151,13 +175,34 @@ export const runSync = async (
         const { kind, message } = failureOf(error);
         await fail(id, signal?.aborted ? 'aborted' : kind, message);
       }
-    } finally {
-      progress.fullDone++;
-      emit();
     }
   };
 
-  for (const ids of chunk([...lastChangeById.keys()], FAST_MAX_IDS)) {
+  const runFull = async (id: number, ts: number) => {
+    await fetchThread(id, ts);
+    progress.fullDone++;
+    emit();
+  };
+
+  //? Un jeu jamais synchronisé passe quand même par `/fast` : `/raw` ne réindexe rien, donc un
+  //? thread absent du cache de WillyJL n'y apparaîtrait jamais.
+  const fastIds: number[] = [];
+  const rawTasks: Promise<void>[] = [];
+  for (const [id, known] of lastChangeById) {
+    if (source === 'raw' && known !== null) {
+      rawTasks.push(
+        limit(async () => {
+          await fetchThread(id, null);
+          progress.checked++;
+          emit();
+        }),
+      );
+    } else {
+      fastIds.push(id);
+    }
+  }
+
+  for (const ids of chunk(fastIds, FAST_MAX_IDS)) {
     //? Séquentiel : on attend la réponse avant d'envoyer le paquet suivant.
     if (signal?.aborted) break;
 
@@ -199,12 +244,6 @@ export const runSync = async (
     emit();
   }
 
-  await Promise.all(fullTasks);
-
-  return {
-    ...progress,
-    ...counters,
-    aborted: signal?.aborted ?? false,
-    durationMs: now() - startedAt,
-  };
+  await Promise.all([...rawTasks, ...fullTasks]);
+  return report();
 };

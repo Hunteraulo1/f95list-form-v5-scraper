@@ -16,7 +16,8 @@ export type SyncScope = 'active' | 'inactive' | 'all';
 
 export interface ApplyInput {
   threadId: number;
-  lastChange: number;
+  /** Nul quand la donnée vient de `/raw` : le `last_change` en base est alors conservé. */
+  lastChange: number | null;
   thread: Thread;
   /** Vrai pour un nouveau jeu, faux pour une actualisation (le nom est alors laissé tel quel). */
   updateName: boolean;
@@ -96,13 +97,13 @@ export const createGameRepository = (pool: Pool): GameRepository => ({
     try {
       await connection.beginTransaction();
 
-      //? COALESCE : une valeur vide côté API conserve celle de la base. `score` et `votes` sont
+      //? COALESCE : une valeur vide côté API (ou un `last_change` inconnu) conserve celle de la base. `score` et `votes` sont
       //? écrits tels quels (voir `toColumns`). `last_updated` est calculé en UTC, quel que soit le
       //? fuseau de la session MariaDB.
       const [games] = await connection.execute<ResultSetHeader>(
         `UPDATE game g
          JOIN \`origin-website\` o ON o.id = g.website
-         SET g.last_change = ?,
+         SET g.last_change = COALESCE(?, g.last_change),
              g.description = COALESCE(?, g.description),
              g.image_external = COALESCE(?, g.image_external),
              g.name = COALESCE(?, g.name),

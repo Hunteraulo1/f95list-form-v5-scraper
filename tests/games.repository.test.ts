@@ -246,6 +246,15 @@ describe.skipIf(!url)('createGameRepository (MariaDB)', () => {
       ).not.toBeNull();
     });
 
+    test('un last_change inconnu (/raw) conserve celui de la base', async () => {
+      await apply();
+      await apply({ lastChange: null });
+
+      expect(await one('SELECT last_change FROM game WHERE id = 1')).toEqual({
+        last_change: 1782662170,
+      });
+    });
+
     test('écrit les données F95Checker : développeur, date en UTC, score, votes, avis', async () => {
       await apply();
 

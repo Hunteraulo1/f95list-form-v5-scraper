@@ -14,13 +14,15 @@ Le flux est celui de F95Checker :
 2. `GET /full/{id}?ts=…` pour les jeux dont le timestamp a augmenté (concurrence limitée par `FULL_CONCURRENCY`).
 3. Les données sont décodées puis écrites dans la base du projet principal.
 
+Exception : le scope `inactive` n'appelle que `GET /raw/{id}` (concurrence `FULL_CONCURRENCY`), sans `/fast`. `/raw` ne déclenche aucun réindexage : la donnée peut être périmée (d'un jour au plus d'après WillyJL, voire davantage si personne ne rafraîchit le thread), ce qui suffit pour des jeux inactifs. Comme `/raw` ne donne pas de timestamp, chaque jeu est réécrit à chaque passage et son `last_change` est conservé. Les jeux jamais synchronisés (`last_change` nul) passent quand même par `/fast` puis `/full`, car `/raw` ne déclencherait jamais leur indexation.
+
 Seuls les jeux dont l'origine est **F95zone** passent par cette API. Le format réel de l'API est décrit dans [docs/api.md](docs/api.md).
 
 ### Ce qui est écrit en base
 
 | Table | Colonnes | Conditions |
 |---|---|---|
-| `game` | `description`, `image_external`, `developer`, `last_updated`, `downloads`, `reviews`, `score`, `votes`, `last_change` | tous les jeux F95zone concernés |
+| `game` | `description`, `image_external`, `developer`, `last_updated`, `downloads`, `reviews`, `score`, `votes`, `last_change` | tous les jeux F95zone concernés (`last_change` n'est pas touché par le scope `inactive`) |
 | `game` | `name` | **uniquement** avec `updateName` (nouveau jeu), jamais par le cron |
 | `game_edition` | `version`, `status`, `last_auto_check` | éditions avec `auto_check = 1` et `active = 1` |
 
@@ -41,7 +43,7 @@ Toutes les routes, sauf `/health`, demandent `Authorization: Bearer <AUTH_TOKEN>
 | Route | Rôle |
 |---|---|
 | `GET /health` | Healthcheck (Coolify), sans authentification |
-| `POST /sync` | Lance un cycle sur les jeux lus en base. Corps optionnel : `{ "scope": "active" \| "inactive" \| "all" }` (`all` par défaut). Répond `202`, ou `409` si un cycle est déjà en cours |
+| `POST /sync` | Lance un cycle sur les jeux lus en base. Corps optionnel : `{ "scope": "active" \| "inactive" \| "all" }` (`all` par défaut). Répond `202` avec la `source` utilisée (`raw` pour `inactive`, `fast` sinon), ou `409` si un cycle est déjà en cours |
 | `GET /status` | État du cycle en cours et rapport du dernier cycle |
 | `POST /games/:gameId/refresh` | Actualise un jeu existant, sans comparer au `last_change`. Corps optionnel : `{ "updateName": true }` (`false` par défaut) |
 | `GET /threads/:threadId` | Aperçu d'un jeu pas encore en base : renvoie les données décodées et le statut converti, **sans rien écrire** |
@@ -53,7 +55,7 @@ Le verrou de cycle est en mémoire : **une seule instance** du service (pas de r
 ### Portée du cron
 
 - `active` : jeux **actifs** avec au moins une traduction active (édition active et traduction active). À lancer **toutes les 6 h**.
-- `inactive` : tous les autres jeux F95zone en `auto_check` : jeu inactif, ou sans traduction active. **Une fois par jour** suffit.
+- `inactive` : tous les autres jeux F95zone en `auto_check` : jeu inactif, ou sans traduction active. **Une fois par jour** suffit. Passe par `/raw`, sans `/fast`.
 
 ## Configuration
 
@@ -75,7 +77,7 @@ Une ligne JSON par log sur la sortie standard, au format [ECS](https://www.elast
 
 | `event.action` | Niveau | Contenu (`scraper.*`) |
 |---|---|---|
-| `sync.started` | info | `runId`, `scope`, `total` |
+| `sync.started` | info | `runId`, `scope`, `source` (`fast` ou `raw`), `total` |
 | `sync.finished` | info, warn si `partial`/`aborted`, error si `failed` | `runId`, `scope`, `outcome` (`success`, `partial`, `aborted`, `failed`), `total`, `checked`, `changed`, `updated`, `unchanged`, `notFound`, `failed`, `durationMs` |
 | `sync.game.updated` | info | `runId`, `threadId`, `lastChange`, `version`, `apiStatus`, `games`, `editions` |
 | `sync.game.not_found` | warn | `runId`, `threadId` (thread supprimé, privé ou déplacé) |

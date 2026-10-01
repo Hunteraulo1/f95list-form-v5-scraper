@@ -77,7 +77,8 @@ export const createApp = ({
   app.use('/threads/*', bearerAuth({ token: authToken }));
 
   //? Répond tout de suite : le cycle peut durer des heures (première synchro à froid).
-  //? Coolify : `scope: "active"` toutes les 6 h, `scope: "inactive"` une fois par jour.
+  //? Coolify : `scope: "active"` toutes les 6 h, `scope: "inactive"` une fois par jour. Les jeux
+  //? inactifs passent par `/raw` : donnée possiblement périmée, mais aucun `/fast` chez WillyJL.
   app.post('/sync', async (c) => {
     const body = v.safeParse(
       syncBodySchema,
@@ -97,11 +98,17 @@ export const createApp = ({
     if (games.length === 0) {
       return c.json({ started: false, total: 0 }, 200);
     }
-    if (!controller.start(games, { scope: body.output.scope })) {
+    const source = body.output.scope === 'inactive' ? 'raw' : 'fast';
+    if (!controller.start(games, { scope: body.output.scope, source })) {
       return c.json({ error: 'sync_already_running' }, 409);
     }
     return c.json(
-      { started: true, scope: body.output.scope, total: games.length },
+      {
+        started: true,
+        scope: body.output.scope,
+        source,
+        total: games.length,
+      },
       202,
     );
   });

@@ -231,4 +231,129 @@ describe('runSync', () => {
     expect(sizes).toEqual([1]);
     expect(report.total).toBe(1);
   });
+
+  describe('source raw', () => {
+    test('n’appelle que /raw, en parallèle limité, sans timestamp', async () => {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const updates: (number | null)[] = [];
+      const { sink, client } = setup({
+        fast: async () => {
+          throw new Error('/fast ne doit pas être appelé');
+        },
+        full: async () => {
+          throw new Error('/full ne doit pas être appelé');
+        },
+        raw: async (id) => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await Bun.sleep(5);
+          inFlight--;
+          return thread(`jeu ${id}`);
+        },
+      });
+      sink.onUpdate = ({ lastChange }) => void updates.push(lastChange);
+      const games = Array.from({ length: 12 }, (_, i) => ({
+        id: i + 1,
+        lastChange: 100,
+      }));
+
+      const report = await runSync(games, {
+        client,
+        sink,
+        fullConcurrency: 3,
+        source: 'raw',
+      });
+
+      expect(maxInFlight).toBe(3);
+      expect(updates).toEqual(Array(12).fill(null));
+      expect(report).toMatchObject({
+        total: 12,
+        checked: 12,
+        changed: 0,
+        updated: 12,
+        failed: 0,
+      });
+    });
+
+    test('un jeu jamais synchronisé passe quand même par /fast puis /full', async () => {
+      const calls: string[] = [];
+      const updates: [number, number | null][] = [];
+      const { sink, client } = setup({
+        fast: async (ids) => {
+          calls.push(`fast:${ids.join(',')}`);
+          return new Map(ids.map((id) => [id, 300]));
+        },
+        full: async (id) => {
+          calls.push(`full:${id}`);
+          return thread(`jeu ${id}`);
+        },
+        raw: async (id) => {
+          calls.push(`raw:${id}`);
+          return thread(`jeu ${id}`);
+        },
+      });
+      sink.onUpdate = ({ id, lastChange }) =>
+        void updates.push([id, lastChange]);
+
+      const report = await runSync(
+        [
+          { id: 1, lastChange: 100 },
+          { id: 2, lastChange: null },
+        ],
+        { client, sink, fullConcurrency: 5, source: 'raw' },
+      );
+
+      expect(calls.sort()).toEqual(['fast:2', 'full:2', 'raw:1']);
+      expect(updates.sort()).toEqual([
+        [1, null],
+        [2, 300],
+      ]);
+      expect(report).toMatchObject({ total: 2, checked: 2, updated: 2 });
+    });
+
+    test('un thread introuvable ou en échec est signalé comme en mode fast', async () => {
+      const { events, sink, client } = setup({
+        raw: async (id) => {
+          if (id === 2) throw new IndexerError('not_found', 'THREAD_MISSING');
+          if (id === 3) throw new IndexerError('network', 'timeout');
+          return thread(`jeu ${id}`);
+        },
+      });
+
+      const report = await runSync(
+        [1, 2, 3].map((id) => ({ id, lastChange: 100 })),
+        { client, sink, fullConcurrency: 5, source: 'raw' },
+      );
+
+      expect(events.gone).toEqual([2]);
+      expect(events.failures).toEqual(['3:network']);
+      expect(report).toMatchObject({ updated: 1, notFound: 1, failed: 1 });
+    });
+
+    test('un signal interrompu marque les jeux restants en aborted', async () => {
+      const abort = new AbortController();
+      const { events, sink, client } = setup({
+        raw: async (id) => {
+          abort.abort();
+          return thread(`jeu ${id}`);
+        },
+      });
+
+      const report = await runSync(
+        [1, 2, 3].map((id) => ({ id, lastChange: 100 })),
+        {
+          client,
+          sink,
+          fullConcurrency: 1,
+          source: 'raw',
+          signal: abort.signal,
+        },
+      );
+
+      expect(events.updates).toEqual([1]);
+      expect(events.failures).toEqual(['2:aborted', '3:aborted']);
+      expect(report.aborted).toBe(true);
+    });
+  });
 });

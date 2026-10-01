@@ -6,6 +6,7 @@ import {
   type SyncProgress,
   type SyncReport,
   type SyncSink,
+  type SyncSource,
   type TrackedGame,
 } from './cycle.ts';
 
@@ -24,7 +25,10 @@ export type SyncStatus =
       lastReport: SyncReport | null;
     };
 
-type RunOptions = Omit<SyncOptions, 'signal' | 'onProgress' | 'sink'> & {
+type RunOptions = Omit<
+  SyncOptions,
+  'signal' | 'onProgress' | 'sink' | 'source'
+> & {
   /** Un sink par cycle, pour que chaque log porte le `runId` du cycle. */
   sinkFor: (run: { runId: string }) => SyncSink;
 };
@@ -60,7 +64,7 @@ export const createSyncController = (options: RunOptions, logger: Logger) => {
     /** `false` si un cycle est déjà en cours. */
     start(
       games: readonly TrackedGame[],
-      { scope }: { scope: string },
+      { scope, source = 'fast' }: { scope: string; source?: SyncSource },
     ): boolean {
       if (running) return false;
 
@@ -77,13 +81,14 @@ export const createSyncController = (options: RunOptions, logger: Logger) => {
       running = state;
       lastError = null;
       logger.info(
-        { event: 'sync.started', runId, scope, total: games.length },
+        { event: 'sync.started', runId, scope, source, total: games.length },
         'cycle démarré',
       );
 
       const { sinkFor, ...syncOptions } = options;
       state.done = runSync(games, {
         ...syncOptions,
+        source,
         sink: sinkFor({ runId }),
         signal: abort.signal,
         onProgress: (progress) => {

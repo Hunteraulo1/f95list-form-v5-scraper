@@ -122,12 +122,35 @@ describe('POST /sync', () => {
     expect(await response.json()).toEqual({
       started: true,
       scope: 'active',
+      source: 'fast',
       total: 1,
     });
 
     await call(app, 'POST', '/sync');
     await controller.stop();
     expect(calls.scopes).toEqual(['active', 'all']);
+  });
+
+  test('les jeux inactifs passent par /raw, sans /fast', async () => {
+    const paths: string[] = [];
+    const { app, controller } = setup({
+      client: {
+        fast: async (ids) => {
+          paths.push('fast');
+          return new Map(ids.map((id) => [id, 1782662170]));
+        },
+        raw: async () => {
+          paths.push('raw');
+          return gameThread;
+        },
+      },
+    });
+
+    const response = await call(app, 'POST', '/sync', { scope: 'inactive' });
+    await controller.whenIdle();
+
+    expect(await response.json()).toMatchObject({ source: 'raw' });
+    expect(paths).toEqual(['raw']);
   });
 
   test('refuse un scope inconnu', async () => {
