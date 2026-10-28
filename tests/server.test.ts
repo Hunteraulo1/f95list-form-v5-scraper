@@ -1,70 +1,37 @@
 import { describe, expect, test } from 'bun:test';
 import * as v from 'valibot';
-import type { ApplyInput, GameRepository, SyncScope } from '../src/db/games.ts';
 import { type IndexerClient, IndexerError } from '../src/indexer/client.ts';
 import { threadSchema } from '../src/indexer/schemas.ts';
-import { createApp } from '../src/server/app.ts';
-import { createSyncController } from '../src/sync/controller.ts';
+import { CHECK_MAX_THREADS, createApp } from '../src/server/app.ts';
 import { captureLogger, fixture } from './helpers.ts';
 
 const TOKEN = 'a-token-of-16-chars+';
+const TS = 1782662170;
 const gameThread = v.parse(threadSchema, fixture('full-game'));
 
-const setup = (
-  overrides: {
-    client?: Partial<IndexerClient>;
-    repository?: Partial<GameRepository>;
-  } = {},
-) => {
-  const calls = {
-    scopes: [] as SyncScope[],
-    applied: [] as ApplyInput[],
-  };
+const setup = (overrides: { client?: Partial<IndexerClient> } = {}) => {
+  const calls = { fast: [] as number[][], full: [] as number[] };
   const client: IndexerClient = {
-    fast: async (ids) => new Map(ids.map((id) => [id, 1782662170])),
-    full: async () => gameThread,
+    fast: async (ids) => {
+      calls.fast.push(ids);
+      return new Map(ids.map((id) => [id, TS]));
+    },
+    full: async (id) => {
+      calls.full.push(id);
+      return gameThread;
+    },
     raw: async () => gameThread,
     ...overrides.client,
   };
-  const repository: GameRepository = {
-    listTracked: async (scope) => {
-      calls.scopes.push(scope);
-      return [{ id: 1000, lastChange: 1 }];
-    },
-    findGame: async (id) =>
-      id === 7 ? { id: 7, threadId: 1000, origin: 'F95zone' } : null,
-    applyThread: async (input) => {
-      calls.applied.push(input);
-      return { games: 1, editions: 2 };
-    },
-    markChecked: async () => {},
-    ...overrides.repository,
-  };
   const captured = captureLogger();
-  const logger = captured.logger;
-  const controller = createSyncController(
-    {
-      client,
-      fullConcurrency: 2,
-      sinkFor: () => ({
-        onUpdate() {},
-        onUnchanged() {},
-        onNotFound() {},
-        onFailure() {},
-      }),
-    },
-    logger,
-  );
   return {
     calls,
     captured,
-    controller,
     app: createApp({
-      controller,
-      repository,
       client,
+      fullConcurrency: 2,
       authToken: TOKEN,
-      logger,
+      logger: captured.logger,
     }),
   };
 };
@@ -87,6 +54,9 @@ const call = (
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
 
+// biome-ignore lint/suspicious/noExplicitAny: corps JSON lus nettement plus simplement en test
+type Results = { results: Record<string, any>[] };
+
 describe('authentification', () => {
   test('/health ne demande pas de token', async () => {
     const { app } = setup();
@@ -96,9 +66,7 @@ describe('authentification', () => {
   test('toutes les autres routes refusent une requête sans bon token', async () => {
     const { app } = setup();
     const routes: [string, string][] = [
-      ['POST', '/sync'],
-      ['GET', '/status'],
-      ['POST', '/games/7/refresh'],
+      ['POST', '/threads/check'],
       ['GET', '/threads/1000'],
     ];
 
@@ -111,166 +79,131 @@ describe('authentification', () => {
   });
 });
 
-describe('POST /sync', () => {
-  test('lit les jeux à suivre en base selon le scope, « all » par défaut', async () => {
-    const { app, calls, controller } = setup();
+describe('POST /threads/check', () => {
+  test('appelle /full seulement pour les threads nouveaux ou modifiés', async () => {
+    const { app, calls } = setup();
 
-    const response = await call(app, 'POST', '/sync', { scope: 'active' });
-    await controller.stop();
-
-    expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({
-      started: true,
-      scope: 'active',
-      source: 'fast',
-      total: 1,
+    const response = await call(app, 'POST', '/threads/check', {
+      threads: [
+        { id: 1, lastChange: TS },
+        { id: 2, lastChange: TS - 1 },
+        { id: 3 },
+      ],
     });
+    const { results } = (await response.json()) as Results;
 
-    await call(app, 'POST', '/sync');
-    await controller.stop();
-    expect(calls.scopes).toEqual(['active', 'all']);
+    expect(response.status).toBe(200);
+    expect(calls.full.sort()).toEqual([2, 3]);
+    expect(results.map((r) => [r.id, r.result])).toEqual([
+      [1, 'unchanged'],
+      [2, 'changed'],
+      [3, 'changed'],
+    ]);
+    expect(results[0]).toEqual({ id: 1, result: 'unchanged', lastChange: TS });
+    expect(results[1]).toMatchObject({
+      lastChange: TS,
+      status: 'completed',
+      thread: { name: 'Homeless School Girl' },
+    });
   });
 
-  test('les jeux inactifs passent par /raw, sans /fast', async () => {
-    const paths: string[] = [];
-    const { app, controller } = setup({
+  test('renvoie les threads supprimés et les échecs sans faire échouer le lot', async () => {
+    const { app } = setup({
       client: {
-        fast: async (ids) => {
-          paths.push('fast');
-          return new Map(ids.map((id) => [id, 1782662170]));
-        },
-        raw: async () => {
-          paths.push('raw');
+        full: async (id) => {
+          if (id === 2) throw new IndexerError('not_found', 'THREAD_MISSING');
+          if (id === 3) throw new IndexerError('network', 'timeout');
           return gameThread;
         },
       },
     });
 
-    const response = await call(app, 'POST', '/sync', { scope: 'inactive' });
-    await controller.whenIdle();
-
-    expect(await response.json()).toMatchObject({ source: 'raw' });
-    expect(paths).toEqual(['raw']);
-  });
-
-  test('refuse un scope inconnu', async () => {
-    const { app } = setup();
-    expect((await call(app, 'POST', '/sync', { scope: 'tout' })).status).toBe(
-      400,
-    );
-  });
-
-  test('ne démarre rien quand aucun jeu n’est à suivre', async () => {
-    const { app, controller } = setup({
-      repository: { listTracked: async () => [] },
+    const response = await call(app, 'POST', '/threads/check', {
+      threads: [{ id: 1 }, { id: 2 }, { id: 3 }],
     });
+    const { results } = (await response.json()) as Results;
 
-    const response = await call(app, 'POST', '/sync');
-
-    expect(await response.json()).toEqual({ started: false, total: 0 });
-    expect(controller.status().state).toBe('idle');
+    expect(response.status).toBe(200);
+    expect(results.map((r) => r.result)).toEqual([
+      'changed',
+      'not_found',
+      'failed',
+    ]);
+    expect(results[2]).toMatchObject({ kind: 'network', message: 'timeout' });
   });
 
-  test('un second /sync pendant un cycle en cours renvoie 409', async () => {
-    let release: () => void = () => {};
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const { app, controller } = setup({
+  test('un /fast en échec marque tout son paquet en échec', async () => {
+    const { app } = setup({
       client: {
-        fast: async (ids) => {
-          await gate;
-          return new Map(ids.map((id) => [id, 1]));
+        fast: async () => {
+          throw new IndexerError('http', 'HTTP 503');
         },
       },
     });
 
-    expect((await call(app, 'POST', '/sync')).status).toBe(202);
-    expect((await call(app, 'POST', '/sync')).status).toBe(409);
-    expect(controller.status().state).toBe('running');
+    const response = await call(app, 'POST', '/threads/check', {
+      threads: [{ id: 1, lastChange: TS }, { id: 2 }],
+    });
+    const { results } = (await response.json()) as Results;
 
-    release();
-    await controller.stop();
-    expect(controller.status().state).toBe('idle');
+    expect(results.map((r) => [r.result, r.kind])).toEqual([
+      ['failed', 'http'],
+      ['failed', 'http'],
+    ]);
+  });
+
+  test('ignore les doublons et garde l’ordre reçu', async () => {
+    const { app, calls } = setup();
+
+    const response = await call(app, 'POST', '/threads/check', {
+      threads: [{ id: 5 }, { id: 4 }, { id: 5 }],
+    });
+    const { results } = (await response.json()) as Results;
+
+    expect(results.map((r) => r.id)).toEqual([5, 4]);
+    expect(calls.fast).toEqual([[5, 4]]);
+  });
+
+  test('refuse un corps invalide, vide ou trop gros', async () => {
+    const { app, calls } = setup();
+    const tooMany = Array.from({ length: CHECK_MAX_THREADS + 1 }, (_, i) => ({
+      id: i + 1,
+    }));
+
+    for (const body of [
+      undefined,
+      { threads: [] },
+      { threads: tooMany },
+      { threads: [{ id: 0 }] },
+      { threads: [{ id: 1, lastChange: 'hier' }] },
+    ]) {
+      expect((await call(app, 'POST', '/threads/check', body)).status).toBe(
+        400,
+      );
+    }
+    expect(calls.fast).toHaveLength(0);
   });
 });
 
-describe('POST /games/:gameId/refresh', () => {
-  test('n’écrase pas le nom par défaut', async () => {
-    const { app, calls } = setup();
-
-    const response = await call(app, 'POST', '/games/7/refresh');
-    const body = (await response.json()) as Record<string, unknown>;
-
-    expect(response.status).toBe(200);
-    expect(calls.applied).toEqual([
-      {
-        threadId: 1000,
-        lastChange: 1782662170,
-        thread: gameThread,
-        updateName: false,
-      },
-    ]);
-    expect(body).toMatchObject({
-      gameId: 7,
-      threadId: 1000,
-      nameUpdated: false,
-      games: 1,
-      editions: 2,
-    });
-  });
-
-  test('met à jour le nom pour un nouveau jeu (updateName)', async () => {
-    const { app, calls } = setup();
-
-    const response = await call(app, 'POST', '/games/7/refresh', {
-      updateName: true,
-    });
-
-    expect(
-      ((await response.json()) as { nameUpdated: boolean }).nameUpdated,
-    ).toBe(true);
-    expect(calls.applied[0]?.updateName).toBe(true);
-  });
-
-  test('404 pour un jeu inconnu, 422 pour une origine ou un thread non pris en charge', async () => {
-    const unknown = setup();
-    expect((await call(unknown.app, 'POST', '/games/8/refresh')).status).toBe(
-      404,
-    );
-
-    const other = setup({
-      repository: {
-        findGame: async () => ({ id: 7, threadId: 5, origin: 'LewdCorner' }),
-      },
-    });
-    const otherResponse = await call(other.app, 'POST', '/games/7/refresh');
-    expect(otherResponse.status).toBe(422);
-    expect(await otherResponse.json()).toEqual({ error: 'unsupported_origin' });
-
-    const noThread = setup({
-      repository: {
-        findGame: async () => ({ id: 7, threadId: null, origin: 'F95zone' }),
-      },
-    });
-    expect((await call(noThread.app, 'POST', '/games/7/refresh')).status).toBe(
-      422,
-    );
-    expect(other.calls.applied).toHaveLength(0);
-  });
-
-  test('un id ou un corps invalide renvoie 400', async () => {
+describe('GET /threads/:threadId', () => {
+  test('renvoie les données fraîches avec le statut converti', async () => {
     const { app } = setup();
 
-    expect((await call(app, 'POST', '/games/abc/refresh')).status).toBe(400);
-    expect(
-      (await call(app, 'POST', '/games/7/refresh', { updateName: 'oui' }))
-        .status,
-    ).toBe(400);
+    const response = await call(app, 'GET', '/threads/1000');
+    const body = (await response.json()) as {
+      status: string;
+      lastChange: number;
+      thread: { name: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.thread.name).toBe('Homeless School Girl');
+    expect(body.status).toBe('completed');
+    expect(body.lastChange).toBe(TS);
   });
 
-  test('un thread supprimé renvoie 404 et rien n’est écrit', async () => {
-    const { app, calls } = setup({
+  test('un thread supprimé renvoie 404', async () => {
+    const { app } = setup({
       client: {
         full: async () => {
           throw new IndexerError('not_found', 'THREAD_MISSING');
@@ -278,42 +211,7 @@ describe('POST /games/:gameId/refresh', () => {
       },
     });
 
-    const response = await call(app, 'POST', '/games/7/refresh');
-
-    expect(response.status).toBe(404);
-    expect(await response.json()).toEqual({ error: 'thread_not_found' });
-    expect(calls.applied).toHaveLength(0);
-  });
-
-  test('une API F95Checker en panne renvoie 502', async () => {
-    const { app } = setup({
-      client: {
-        fast: async () => {
-          throw new IndexerError('network', 'timeout');
-        },
-      },
-    });
-
-    expect((await call(app, 'POST', '/games/7/refresh')).status).toBe(502);
-  });
-});
-
-describe('GET /threads/:threadId', () => {
-  test('renvoie les infos d’un nouveau jeu avec le statut converti, sans rien écrire', async () => {
-    const { app, calls } = setup();
-
-    const response = await call(app, 'GET', '/threads/1000');
-    const body = (await response.json()) as {
-      editionStatus: string;
-      lastChange: number;
-      thread: { name: string };
-    };
-
-    expect(response.status).toBe(200);
-    expect(body.thread.name).toBe('Homeless School Girl');
-    expect(body.editionStatus).toBe('completed');
-    expect(body.lastChange).toBe(1782662170);
-    expect(calls.applied).toHaveLength(0);
+    expect((await call(app, 'GET', '/threads/1000')).status).toBe(404);
   });
 
   test('refuse un id de thread invalide', async () => {
@@ -355,7 +253,7 @@ describe('logs', () => {
       },
     });
 
-    await call(app, 'POST', '/sync', undefined, 'mauvais');
+    await call(app, 'GET', '/threads/1000', undefined, 'mauvais');
     await call(app, 'GET', '/threads/1000');
 
     expect(
@@ -372,17 +270,19 @@ describe('logs', () => {
     });
   });
 
-  test('une actualisation manuelle est journalisée avec ce qui a été touché', async () => {
+  test('une vérification par lot est journalisée avec ses compteurs', async () => {
     const { app, captured } = setup();
 
-    await call(app, 'POST', '/games/7/refresh', { updateName: true });
+    await call(app, 'POST', '/threads/check', {
+      threads: [{ id: 1, lastChange: TS }, { id: 2 }],
+    });
 
-    expect(captured.events('game.refreshed')[0]?.scraper).toMatchObject({
-      gameId: 7,
-      threadId: 1000,
-      updateName: true,
-      games: 1,
-      editions: 2,
+    expect(captured.events('threads.checked')[0]?.scraper).toMatchObject({
+      total: 2,
+      changed: 1,
+      unchanged: 1,
+      notFound: 0,
+      failed: 0,
     });
   });
 });

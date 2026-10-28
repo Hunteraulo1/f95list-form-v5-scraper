@@ -1,12 +1,8 @@
 import { loadConfig } from './config.ts';
-import { createGameRepository } from './db/games.ts';
-import { createPool } from './db/pool.ts';
 import { createIndexerClient } from './indexer/client.ts';
 import { serializeFast } from './indexer/serialize.ts';
 import { createLogger } from './logger.ts';
 import { createApp } from './server/app.ts';
-import { createSyncController } from './sync/controller.ts';
-import { createDbSink } from './sync/db-sink.ts';
 
 const config = loadConfig();
 const logger = createLogger({
@@ -18,7 +14,8 @@ const logger = createLogger({
 //? Au-delà, l'API de WillyJL est probablement congestionnée : à voir dans Kibana avant d'incriminer le scraper.
 const SLOW_REQUEST_MS = 30_000;
 
-//? Un seul client pour tout le service : c'est lui qui garantit qu'aucun `/fast` ne part en parallèle.
+//? Un seul client pour tout le service : c'est lui qui garantit qu'aucun `/fast` ne part en parallèle,
+//? même quand plusieurs vérifications arrivent en même temps.
 const client = serializeFast(
   createIndexerClient({
     baseUrl: config.indexerUrl,
@@ -38,24 +35,11 @@ const client = serializeFast(
     },
   }),
 );
-const pool = createPool(config.databaseUrl);
-const repository = createGameRepository(pool);
-
-const controller = createSyncController(
-  {
-    client,
-    sinkFor: ({ runId }) => createDbSink(repository, logger, runId),
-    fullConcurrency: config.fullConcurrency,
-  },
-  logger,
-);
-
 const server = Bun.serve({
   port: config.port,
   fetch: createApp({
-    controller,
-    repository,
     client,
+    fullConcurrency: config.fullConcurrency,
     authToken: config.authToken,
     logger,
   }).fetch,
@@ -69,12 +53,10 @@ logger.info(
   'scraper démarré',
 );
 
-//? Coolify envoie SIGTERM à chaque redéploiement : on interrompt le cycle proprement.
+//? Coolify envoie SIGTERM à chaque redéploiement : on laisse finir les requêtes en cours.
 const shutdown = async () => {
   logger.info('arrêt demandé');
-  await controller.stop();
   await server.stop();
-  await pool.end();
   process.exit(0);
 };
 process.on('SIGTERM', shutdown);

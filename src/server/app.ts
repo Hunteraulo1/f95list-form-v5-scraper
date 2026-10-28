@@ -3,45 +3,58 @@ import { bearerAuth } from 'hono/bearer-auth';
 import { HTTPException } from 'hono/http-exception';
 import { routePath } from 'hono/route';
 import * as v from 'valibot';
-import type { GameRepository } from '../db/games.ts';
 import { type IndexerClient, IndexerError } from '../indexer/client.ts';
 import type { Logger } from '../logger.ts';
-import { editionStatus } from '../mapping.ts';
-import type { SyncController } from '../sync/controller.ts';
+import { threadStatus } from '../mapping.ts';
+import { checkThreads } from '../sync/check.ts';
 import { fetchLatest } from '../sync/latest.ts';
-import { refreshGame } from '../sync/refresh.ts';
 
-//? Ids MySQL (`mediumint unsigned` pour `game.id`) et ids de thread F95 : entiers positifs.
-const idParam = v.pipe(
+//? Au-delà, une requête dépasse la minute (5 paquets `/fast` de 10, à la file) : à l'appelant
+//? de découper.
+export const CHECK_MAX_THREADS = 50;
+
+//? Ids de thread F95 : entiers positifs.
+const threadId = v.pipe(
+  v.number(),
+  v.integer(),
+  v.minValue(1),
+  v.maxValue(999_999),
+);
+
+const threadIdParam = v.pipe(
   v.string(),
   v.regex(/^\d+$/),
   v.transform(Number),
-  v.integer(),
-  v.minValue(1),
-  v.maxValue(16_777_215),
+  threadId,
 );
 
-const syncBodySchema = v.object({
-  scope: v.optional(v.picklist(['active', 'inactive', 'all']), 'all'),
-});
-
-const refreshBodySchema = v.object({
-  //? Faux par défaut : une actualisation ne doit pas écraser un nom corrigé à la main.
-  updateName: v.optional(v.boolean(), false),
+const checkBodySchema = v.object({
+  threads: v.pipe(
+    v.array(
+      v.object({
+        id: threadId,
+        //? Timestamp renvoyé par un précédent appel. Absent ou nul : thread jamais vérifié, `/full` forcé.
+        lastChange: v.optional(
+          v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1))),
+          null,
+        ),
+      }),
+    ),
+    v.minLength(1),
+    v.maxLength(CHECK_MAX_THREADS),
+  ),
 });
 
 export interface AppDeps {
-  controller: SyncController;
-  repository: GameRepository;
   client: IndexerClient;
+  fullConcurrency: number;
   authToken: string;
   logger: Logger;
 }
 
 export const createApp = ({
-  controller,
-  repository,
   client,
+  fullConcurrency,
   authToken,
   logger,
 }: AppDeps) => {
@@ -71,17 +84,13 @@ export const createApp = ({
   //? Healthcheck Coolify : sans authentification.
   app.get('/health', (c) => c.json({ status: 'ok' }));
 
-  app.use('/sync', bearerAuth({ token: authToken }));
-  app.use('/status', bearerAuth({ token: authToken }));
-  app.use('/games/*', bearerAuth({ token: authToken }));
   app.use('/threads/*', bearerAuth({ token: authToken }));
 
-  //? Répond tout de suite : le cycle peut durer des heures (première synchro à froid).
-  //? Coolify : `scope: "active"` toutes les 6 h, `scope: "inactive"` une fois par jour. Les jeux
-  //? inactifs passent par `/raw` : donnée possiblement périmée, mais aucun `/fast` chez WillyJL.
-  app.post('/sync', async (c) => {
+  //? Remplace `checker.php` pour l'auto-check de f95-france : rien n'est écrit, l'appelant
+  //? conserve `lastChange` et le renvoie au passage suivant pour éviter les `/full` inutiles.
+  app.post('/threads/check', async (c) => {
     const body = v.safeParse(
-      syncBodySchema,
+      checkBodySchema,
       await c.req.json().catch(() => ({})),
     );
     if (!body.success) {
@@ -90,81 +99,41 @@ export const createApp = ({
         400,
       );
     }
-    if (controller.status().state === 'running') {
-      return c.json({ error: 'sync_already_running' }, 409);
-    }
 
-    const games = await repository.listTracked(body.output.scope);
-    if (games.length === 0) {
-      return c.json({ started: false, total: 0 }, 200);
-    }
-    const source = body.output.scope === 'inactive' ? 'raw' : 'fast';
-    if (!controller.start(games, { scope: body.output.scope, source })) {
-      return c.json({ error: 'sync_already_running' }, 409);
-    }
-    return c.json(
-      {
-        started: true,
-        scope: body.output.scope,
-        source,
-        total: games.length,
-      },
-      202,
-    );
-  });
-
-  app.get('/status', (c) => c.json(controller.status()));
-
-  //? Actualisation manuelle d'un jeu, ou remplissage d'un nouveau jeu déjà créé (`updateName`).
-  app.post('/games/:gameId/refresh', async (c) => {
-    const gameId = v.safeParse(idParam, c.req.param('gameId'));
-    const body = v.safeParse(
-      refreshBodySchema,
-      await c.req.json().catch(() => ({})),
-    );
-    if (!gameId.success || !body.success) {
-      return c.json({ error: 'invalid_request' }, 400);
-    }
-
-    const result = await refreshGame(
-      { repository, client },
-      gameId.output,
-      body.output,
-    );
-    if (!result.ok) {
-      return c.json(
-        { error: result.reason },
-        result.reason === 'game_not_found' ? 404 : 422,
-      );
-    }
+    const results = await checkThreads(body.output.threads, {
+      client,
+      fullConcurrency,
+      //? L'appelant a abandonné : inutile de continuer à solliciter l'API.
+      signal: c.req.raw.signal,
+    });
+    const count = (result: string) =>
+      results.filter((r) => r.result === result).length;
     logger.info(
       {
-        event: 'game.refreshed',
-        gameId: result.gameId,
-        threadId: result.threadId,
-        updateName: body.output.updateName,
-        lastChange: result.lastChange,
-        games: result.games,
-        editions: result.editions,
+        event: 'threads.checked',
+        total: results.length,
+        changed: count('changed'),
+        unchanged: count('unchanged'),
+        notFound: count('not_found'),
+        failed: count('failed'),
       },
-      `jeu ${result.gameId} actualisé manuellement`,
+      `${results.length} threads vérifiés`,
     );
-    return c.json(result);
+    return c.json({ results });
   });
 
-  //? Aperçu d'un jeu qui n'existe pas encore en base : rien n'est écrit.
+  //? Données fraîches d'un thread (ajout d'un jeu, scrape manuel), sans comparer à un `lastChange`.
   app.get('/threads/:threadId', async (c) => {
-    const threadId = v.safeParse(idParam, c.req.param('threadId'));
-    if (!threadId.success || threadId.output > 999_999) {
+    const id = v.safeParse(threadIdParam, c.req.param('threadId'));
+    if (!id.success) {
       return c.json({ error: 'invalid_request' }, 400);
     }
 
-    const { lastChange, thread } = await fetchLatest(client, threadId.output);
+    const { lastChange, thread } = await fetchLatest(client, id.output);
     return c.json({
-      threadId: threadId.output,
+      threadId: id.output,
       lastChange,
-      //? Valeur de `game_edition.status` correspondante, `null` si l'API renvoie un statut inconnu.
-      editionStatus: editionStatus(thread.status),
+      status: threadStatus(thread.status),
       thread,
     });
   });

@@ -2,11 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import { loadConfig } from '../src/config.ts';
 
 const AUTH_TOKEN = 'a-token-of-16-chars+';
-const DATABASE_URL = 'mysql://user:pass@localhost:3306/db';
 
 describe('loadConfig', () => {
   test('applique les valeurs par défaut', () => {
-    const config = loadConfig({ AUTH_TOKEN, DATABASE_URL });
+    const config = loadConfig({ AUTH_TOKEN });
 
     expect(config.indexerUrl).toBe('https://api.f95checker.dev');
     expect(config.port).toBe(3000);
@@ -16,7 +15,6 @@ describe('loadConfig', () => {
   test('le User-Agent identifie le projet, sa version et un contact', () => {
     const config = loadConfig({
       AUTH_TOKEN,
-      DATABASE_URL,
       USER_AGENT_CONTACT: 'me@example.com',
     });
 
@@ -26,39 +24,30 @@ describe('loadConfig', () => {
   });
 
   test("exige un token d'au moins 16 caractères", () => {
-    expect(() => loadConfig({ DATABASE_URL })).toThrow(
-      'Configuration invalide',
-    );
-    expect(() => loadConfig({ AUTH_TOKEN: 'court', DATABASE_URL })).toThrow(
+    expect(() => loadConfig({})).toThrow('Configuration invalide');
+    expect(() => loadConfig({ AUTH_TOKEN: 'court' })).toThrow(
       'Configuration invalide',
     );
   });
 
   test('nom de service et environnement pour les logs, avec des valeurs par défaut', () => {
-    expect(loadConfig({ AUTH_TOKEN, DATABASE_URL })).toMatchObject({
+    expect(loadConfig({ AUTH_TOKEN })).toMatchObject({
       serviceName: 'f95list-scraper',
       environment: 'unknown',
     });
     expect(
       loadConfig({
         AUTH_TOKEN,
-        DATABASE_URL,
         SERVICE_NAME: 'scraper-v5',
         APP_ENV: 'prod',
       }),
     ).toMatchObject({ serviceName: 'scraper-v5', environment: 'prod' });
   });
 
-  test('exige DATABASE_URL', () => {
-    expect(() => loadConfig({ AUTH_TOKEN })).toThrow('Configuration invalide');
-  });
-
   test('refuse une URL ou un port invalides', () => {
     expect(() =>
-      loadConfig({ AUTH_TOKEN, DATABASE_URL, F95INDEXER_URL: 'pas-une-url' }),
+      loadConfig({ AUTH_TOKEN, F95INDEXER_URL: 'pas-une-url' }),
     ).toThrow();
-    expect(() =>
-      loadConfig({ AUTH_TOKEN, DATABASE_URL, PORT: '99999' }),
-    ).toThrow();
+    expect(() => loadConfig({ AUTH_TOKEN, PORT: '99999' })).toThrow();
   });
 });

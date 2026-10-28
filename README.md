@@ -1,6 +1,8 @@
-# f95list-form-v5-scraper
+# f95list-form-v5-scraper — branche `v4`
 
-Service de synchronisation des jeux pour [f95list-form-v5](https://github.com/Hunteraulo1/f95list-form-v5). Il n'a pas d'interface : le projet principal le pilote par HTTP, et Coolify déclenche les mises à jour automatiques.
+Variante du scraper pour **[f95-france](https://github.com/Hunteraulo1/f95-france)** (v4). F95zone bloque désormais les accès directs (Cloudflare), donc `checker.php` et le scrape HTML des threads ne passent plus. Ce service fait le relais vers l'API de F95Checker.
+
+Contrairement à la branche `main` (f95list-form-v5), **il n'a pas de base de données et n'écrit rien** : f95-france l'appelle par HTTP et garde toute sa logique métier (bumps de version, notifications Discord, historique, Google Sheets).
 
 ## Remerciements
 
@@ -10,104 +12,93 @@ Les données viennent de l'API de cache de **[WillyJL](https://github.com/WillyJ
 
 Le flux est celui de F95Checker :
 
-1. `GET /fast?ids=…` par paquets de **10**, **un seul à la fois** dans tout le service (cycle, actualisation manuelle et aperçu compris), timeout 120 s. Il renvoie le timestamp du dernier changement de chaque jeu.
-2. `GET /full/{id}?ts=…` pour les jeux dont le timestamp a augmenté (concurrence limitée par `FULL_CONCURRENCY`).
-3. Les données sont décodées puis écrites dans la base du projet principal.
+1. `GET /fast?ids=…` par paquets de **10**, **un seul à la fois** dans tout le service, même si plusieurs requêtes arrivent en parallèle. Timeout 120 s. Il renvoie le timestamp du dernier changement de chaque thread.
+2. `GET /full/{id}?ts=…` pour les threads dont le timestamp a augmenté, ou dont l'appelant ne connaît pas le timestamp (concurrence limitée par `FULL_CONCURRENCY`).
 
-Exception : le scope `inactive` n'appelle que `GET /raw/{id}` (concurrence `FULL_CONCURRENCY`), sans `/fast`. `/raw` ne déclenche aucun réindexage : la donnée peut être périmée (d'un jour au plus d'après WillyJL, voire davantage si personne ne rafraîchit le thread), ce qui suffit pour des jeux inactifs. Comme `/raw` ne donne pas de timestamp, chaque jeu est réécrit à chaque passage et son `last_change` est conservé. Les jeux jamais synchronisés (`last_change` nul) passent quand même par `/fast` puis `/full`, car `/raw` ne déclencherait jamais leur indexation.
+**C'est à f95-france de stocker le `lastChange`** de chaque jeu et de le renvoyer à l'appel suivant. Sans lui, chaque vérification appelle `/full` pour tous les jeux, ce qui charge inutilement l'API de WillyJL.
 
-Seuls les jeux dont l'origine est **F95zone** passent par cette API. Le format réel de l'API est décrit dans [docs/api.md](docs/api.md).
-
-### Ce qui est écrit en base
-
-| Table | Colonnes | Conditions |
-|---|---|---|
-| `game` | `description`, `image_external`, `developer`, `last_updated`, `downloads`, `reviews`, `score`, `votes`, `last_change` | tous les jeux F95zone concernés (`last_change` n'est pas touché par le scope `inactive`) |
-| `game` | `name` | **uniquement** avec `updateName` (nouveau jeu), jamais par le cron |
-| `game_edition` | `version`, `status`, `last_auto_check` | éditions avec `auto_check = 1` et `active = 1` |
-
-Détails de conversion (voir [src/db/columns.ts](src/db/columns.ts)) :
-- `last_updated` est écrit **en UTC**, quel que soit le fuseau de la session MariaDB : ton projet doit le lire comme de l'UTC. C'est la date de mise à jour du thread, que l'API remplace par la date du jour à chaque changement de version.
-- `downloads` est un JSON `[{platform, links: [{host, url}]}]`. Les « liens » XPath hérités de l'API (`//a[starts-with(@href,…)]`) sont **écartés**, car inutilisables ; les plateformes qui n'ont plus aucun lien disparaissent aussi.
-- `reviews` est un JSON `[{user, score, message, likes, timestamp}]`.
-- `score` et `votes` sont écrits tels quels, sauf qu'**un jeu sans vote a un `score` nul** (le `0.0` de l'API signifie « pas noté »).
-
-Une valeur vide ou inconnue côté API (description vide, pas d'image, pas de développeur, pas de lien, statut « unchecked ») **n'efface jamais** la valeur en base. `description_fr` n'est jamais touché. Les tags ne sont pas encore synchronisés.
-
-Le schéma appartient au projet principal (MikroORM) : le scraper ne migre rien. Il a besoin des colonnes de `game` ajoutées par les migrations `Migration20260921120000_add_game_last_change` et `Migration20260921130000_add_game_f95checker_data` de f95list-form-v5.
+Le format réel de l'API est décrit dans [docs/api.md](docs/api.md).
 
 ## API HTTP
 
 Toutes les routes, sauf `/health`, demandent `Authorization: Bearer <AUTH_TOKEN>`.
 
-| Route | Rôle |
-|---|---|
-| `GET /health` | Healthcheck (Coolify), sans authentification |
-| `POST /sync` | Lance un cycle sur les jeux lus en base. Corps optionnel : `{ "scope": "active" \| "inactive" \| "all" }` (`all` par défaut). Répond `202` avec la `source` utilisée (`raw` pour `inactive`, `fast` sinon), ou `409` si un cycle est déjà en cours |
-| `GET /status` | État du cycle en cours et rapport du dernier cycle |
-| `POST /games/:gameId/refresh` | Actualise un jeu existant, sans comparer au `last_change`. Corps optionnel : `{ "updateName": true }` (`false` par défaut) |
-| `GET /threads/:threadId` | Aperçu d'un jeu pas encore en base : renvoie les données décodées et le statut converti, **sans rien écrire** |
+| Route | Rôle | Remplace dans f95-france |
+|---|---|---|
+| `GET /health` | Healthcheck (Coolify), sans authentification | |
+| `POST /threads/check` | Vérifie un lot de threads (**50 au maximum**) | `checker.php` dans l'auto-check |
+| `GET /threads/:threadId` | Données fraîches d'un thread | `scrapeF95Thread` (HTML du thread) |
 
-`gameId` est l'id du jeu en base, `threadId` l'id du thread F95zone. `POST /games/:gameId/refresh` renvoie `404` (jeu inconnu, ou thread supprimé côté F95), `422` (origine autre que F95zone, ou pas de `thread_id`) ou `502` (API de F95Checker indisponible).
+### `POST /threads/check`
 
-Le verrou de cycle est en mémoire : **une seule instance** du service (pas de réplicas dans Coolify).
+```json
+{ "threads": [{ "id": 1000, "lastChange": 1782662170 }, { "id": 2000 }] }
+```
 
-### Portée du cron
+`lastChange` est facultatif : absent ou `null`, le thread passe par `/full` quoi qu'il arrive. Les doublons sont ignorés. Un corps invalide, vide ou de plus de 50 threads renvoie `400`.
 
-- `active` : jeux **actifs** avec au moins une traduction active (édition active et traduction active). À lancer **toutes les 6 h**.
-- `inactive` : tous les autres jeux F95zone en `auto_check` : jeu inactif, ou sans traduction active. **Une fois par jour** suffit. Passe par `/raw`, sans `/fast`.
+La réponse est toujours un `200`, même si certains threads échouent. Les résultats suivent l'ordre reçu :
+
+```json
+{
+  "results": [
+    { "id": 1000, "result": "unchanged", "lastChange": 1782662170 },
+    { "id": 2000, "result": "changed", "lastChange": 1789687254, "status": "completed", "thread": { "name": "…", "version": "…", "…": "…" } },
+    { "id": 3000, "result": "not_found" },
+    { "id": 4000, "result": "failed", "kind": "network", "message": "…" }
+  ]
+}
+```
+
+- `changed` : à stocker. `lastChange` est le nouveau timestamp, `thread` les données décodées (voir `Thread` dans [src/indexer/schemas.ts](src/indexer/schemas.ts)).
+- `unchanged` : rien n'a bougé, `thread` n'est pas renvoyé.
+- `not_found` : thread supprimé, privé ou déplacé.
+- `failed` : à réessayer au passage suivant, sans toucher au `lastChange` stocké. `kind` vaut `network`, `http`, `index_error`, `invalid_response`, `invalid_timestamp`, `bad_request` ou `aborted`.
+
+Un lot de 50 threads demande 5 appels `/fast` à la suite, d'environ 3 s chacun (davantage si l'API est chargée), plus les `/full`. Côté f95-france, il faut donc un timeout de plusieurs minutes. Si l'appelant coupe la connexion, la vérification s'arrête.
+
+### `GET /threads/:threadId`
+
+Passe par `/fast` puis `/full`, sans rien comparer. Renvoie `{ threadId, lastChange, status, thread }`, `404` si le thread n'existe pas, `502` si l'API de F95Checker est indisponible.
+
+### Conversions
+
+- `status` : `in_progress`, `completed`, `on_hold` ou `abandoned`, d'après [src/mapping.ts](src/mapping.ts). Vaut `null` pour un identifiant inconnu : l'appelant garde alors son statut. L'identifiant brut reste disponible dans `thread.status`.
+- `thread.type` (moteur) et `thread.tags` sont des **identifiants numériques non convertis**. Le mapping des tags vient de F95Checker (GPLv3) : reprise à décider.
+- `thread.version` vaut `null` si elle est inconnue, `thread.imageUrl` vaut `null` sans image.
+- `thread.lastUpdated`, `lastChange` et `thread.cachedAt` sont des timestamps unix en secondes.
 
 ## Configuration
 
-Voir [.env.example](.env.example). `DATABASE_URL` et `AUTH_TOKEN` (16 caractères minimum) sont obligatoires. En production, préférer un utilisateur MariaDB limité aux droits `SELECT` et `UPDATE` sur les tables `game`, `game_edition`, `game_translation` et `origin-website`.
+Voir [.env.example](.env.example). Seul `AUTH_TOKEN` (16 caractères minimum) est obligatoire.
 
-Le User-Agent envoyé à l'API, `f95list-scraper/<version> (+<USER_AGENT_CONTACT>)`, permet à WillyJL d'identifier ce projet en cas de congestion.
+Le User-Agent envoyé à l'API, `f95list-scraper/<version> (+<USER_AGENT_CONTACT>)`, permet à WillyJL d'identifier le projet en cas de congestion.
 
 ## Logs
 
-Une ligne JSON par log sur la sortie standard, au format [ECS](https://www.elastic.co/docs/reference/ecs) : c'est au collecteur de la nouvelle stack (Filebeat, Elastic Agent…) de les expédier vers Elasticsearch. Rien n'est écrit en base pour ça.
+Une ligne JSON par log sur la sortie standard, au format [ECS](https://www.elastic.co/docs/reference/ecs) : c'est au collecteur (Filebeat, Elastic Agent…) de les expédier vers Elasticsearch.
 
-```json
-{"log":{"level":"warn"},"@timestamp":"…","service":{"name":"f95list-scraper","type":"bun","environment":"prod"},
- "event":{"dataset":"f95list-scraper","action":"sync.game.failed"},
- "scraper":{"runId":"…","threadId":42,"kind":"network","reason":"…"},"message":"échec de synchro du thread 42 (network)"}
-```
-
-`event.action` nomme l'événement, tout le reste des données est sous `scraper.*`, une erreur sous `error.*`. `scraper.runId` relie tous les logs d'un même cycle.
+`event.action` nomme l'événement, tout le reste des données est sous `scraper.*`, une erreur sous `error.*`.
 
 | `event.action` | Niveau | Contenu (`scraper.*`) |
 |---|---|---|
-| `sync.started` | info | `runId`, `scope`, `source` (`fast` ou `raw`), `total` |
-| `sync.finished` | info, warn si `partial`/`aborted`, error si `failed` | `runId`, `scope`, `outcome` (`success`, `partial`, `aborted`, `failed`), `total`, `checked`, `changed`, `updated`, `unchanged`, `notFound`, `failed`, `durationMs` |
-| `sync.game.updated` | info | `runId`, `threadId`, `lastChange`, `version`, `apiStatus`, `games`, `editions` |
-| `sync.game.not_found` | warn | `runId`, `threadId` (thread supprimé, privé ou déplacé) |
-| `sync.game.failed` | warn, error si `bad_request`/`invalid_response` | `runId`, `threadId`, `kind`, `reason` |
-| `game.refreshed` | info | `gameId`, `threadId`, `updateName`, `lastChange`, `games`, `editions` |
+| `threads.checked` | info | `total`, `changed`, `unchanged`, `notFound`, `failed` |
 | `indexer.request` | info pour `/fast`, debug pour le reste, warn si échec ou plus de 30 s | `path`, `status`, `durationMs`, `cache` (`cf-cache-status`) |
 | `indexer.error` | warn | `kind`, `reason` (API de F95Checker en panne) |
 | `http.request` | info, warn si 4xx, error si 5xx | `method`, `path`, `route`, `status`, `durationMs` (le healthcheck est exclu) |
-
-Pistes de requêtes Kibana : `event.action: "sync.finished" and scraper.outcome: "partial"` (cycles à problème), `event.action: "sync.game.failed"` (jeux en erreur), `event.action: "indexer.request" and scraper.path: /fast*` (latence de `/fast`, à regarder avant d'incriminer le scraper si WillyJL est lent). Un `sync.started` sans `sync.finished` correspondant (même `runId`) signale un cycle interrompu brutalement.
 
 ## Développement
 
 ```sh
 bun install
-cp .env.example .env     # renseigner DATABASE_URL et AUTH_TOKEN
+cp .env.example .env     # renseigner AUTH_TOKEN
 bun run dev              # serveur avec rechargement
-bun test                 # tests (les tests SQL sont ignorés sans TEST_DATABASE_URL)
+bun test                 # tests
 bun run check            # typecheck
 bun run lint             # Biome
 ```
 
-Tests d'intégration SQL, contre une vraie MariaDB. Ils **détruisent** les tables `game*` et `origin-website` de la base visée : n'utiliser qu'une base dédiée.
-
-```sh
-docker exec f95list-form-v5-mariadb mariadb -uroot -proot -e "create database if not exists f95scraper_test"
-TEST_DATABASE_URL=mysql://root:root@localhost:3306/f95scraper_test bun test
-```
-
-Pour voir ce que renvoie la vraie API, sans rien écrire :
+Pour voir ce que renvoie la vraie API :
 
 ```sh
 bun run explore 1000 2000          # /fast puis /full (10 ids maximum, séquentiel)
@@ -118,9 +109,8 @@ bun run explore --json 1000        # réponse complète décodée
 ## Déploiement (Coolify)
 
 - Application construite depuis le `Dockerfile`, port `3000`, healthcheck `/health` (déjà défini dans l'image).
-- Variables d'environnement : `DATABASE_URL`, `AUTH_TOKEN`, et `USER_AGENT_CONTACT` si besoin.
-- Deux Scheduled Tasks, chacune un `curl -X POST` vers `/sync` avec le token :
-  - `0 */6 * * *` avec `{"scope":"active"}`
-  - `30 3 * * *` avec `{"scope":"inactive"}`
+- Variables d'environnement : `AUTH_TOKEN`, et `USER_AGENT_CONTACT` si besoin.
+- Pas de Scheduled Task : c'est le cron de f95-france (`/api/cron/check-version`) qui appelle ce service.
+- **Une seule instance** : la garantie « un seul `/fast` à la fois » est en mémoire.
 
-> **Avant la toute première synchro** : la première passe est « à froid » (`last_change` nul partout). Chaque thread absent du cache de WillyJL est alors réindexé un par un chez lui. Le prévenir avant de lancer le premier cycle sur ~2 700 jeux, comme le demande le passation (section 8.1).
+> **Avant la première vérification** : tous les `lastChange` sont inconnus, donc chaque jeu passe par `/full`, et les threads absents du cache de WillyJL sont réindexés chez lui. Le prévenir avant, et lui confirmer que f95-france utilise aussi son API.

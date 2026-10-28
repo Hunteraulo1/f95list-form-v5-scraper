@@ -18,8 +18,6 @@ if (ids.length === 0) {
 const { indexerUrl, userAgent } = loadConfig({
   ...process.env,
   AUTH_TOKEN: process.env.AUTH_TOKEN ?? 'explore-script-no-server',
-  DATABASE_URL:
-    process.env.DATABASE_URL ?? 'mysql://unused:unused@localhost/unused',
 });
 const client = createIndexerClient({ baseUrl: indexerUrl, userAgent });
 console.error(`→ ${indexerUrl}  (${userAgent})\n`);

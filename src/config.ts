@@ -27,8 +27,6 @@ const envSchema = v.object({
     'https://github.com/Hunteraulo1/f95list-form-v5-scraper',
   ),
   PORT: v.optional(port, '3000'),
-  //? Base du projet principal (MariaDB). Le schéma appartient à ce projet : le scraper ne migre rien.
-  DATABASE_URL: v.pipe(v.string(), v.url()),
   AUTH_TOKEN: v.pipe(v.string(), v.minLength(16)),
   FULL_CONCURRENCY: v.optional(concurrency, '5'),
   //? Champs `service.name` et `service.environment` des logs.
@@ -56,7 +54,6 @@ export const loadConfig = (
     F95INDEXER_URL,
     USER_AGENT_CONTACT,
     PORT,
-    DATABASE_URL,
     AUTH_TOKEN,
     FULL_CONCURRENCY,
     SERVICE_NAME,
@@ -69,7 +66,6 @@ export const loadConfig = (
     //? Distinctif, demandé par WillyJL pour identifier chaque projet en cas de congestion.
     userAgent: `f95list-scraper/${pkg.version} (+${USER_AGENT_CONTACT})`,
     port: PORT,
-    databaseUrl: DATABASE_URL,
     authToken: AUTH_TOKEN,
     fullConcurrency: FULL_CONCURRENCY,
     logLevel: LOG_LEVEL,
